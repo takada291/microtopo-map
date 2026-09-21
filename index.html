@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>微地形図アプリ</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        body { margin: 0; padding: 0; display: flex; flex-direction: column; height: 100vh; font-family: sans-serif; }
+        
+        /* 免責事項モーダル */
+        #modal { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 9999; display: flex; justify-content: center; align-items: center; }
+        .modal-content { background: #fff; padding: 20px; max-width: 500px; width: 90%; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.3); }
+        .modal-content h3 { color: #d32f2f; margin-top: 0; }
+        .modal-content p { font-size: 14px; line-height: 1.6; }
+        
+        #controls { padding: 10px; background: #f8f9fa; display: flex; gap: 8px; align-items: center; z-index: 1000; border-bottom: 1px solid #ccc; flex-wrap: wrap; }
+        #map { flex-grow: 1; width: 100%; }
+        
+        button { padding: 8px 12px; font-size: 14px; color: white; border: none; cursor: pointer; border-radius: 4px; font-weight: bold; white-space: nowrap; }
+        .btn-blue { background-color: #007bff; }
+        .btn-blue:hover { background-color: #0056b3; }
+        .btn-green { background-color: #28a745; }
+        .btn-green:hover { background-color: #218838; }
+        .btn-red { background-color: #dc3545; }
+        .btn-red:hover { background-color: #c82333; }
+        .btn-red:disabled { background-color: #e49ca2; cursor: not-allowed; }
+        
+        select, input[type="text"] { padding: 6px; font-size: 14px; border: 1px solid #ccc; border-radius: 4px; }
+        input[type="text"] { width: 130px; }
+        
+        #loading { display: none; font-weight: bold; color: #d32f2f; font-size: 14px; animation: blink 1s infinite; }
+        @keyframes blink { 50% { opacity: 0.5; } }
+    </style>
+</head>
+<body>
+
+<!-- 確認・同意モーダル -->
+<div id="modal">
+    <div class="modal-content">
+        <h3>🚨 ご利用にあたって（免責事項）</h3>
+        <p>「赤色立体図」はアジア航測株式会社の登録商標であり、独自の特許技術です。</p>
+        <p>本アプリで作成される<strong>「微地形図」</strong>は、特許技術（地上開度・地下開度等の計算）を使用せず、地理院APIのDEMデータに対して、隣接ピクセルの高低差（ラプラシアンフィルタと傾斜量）を利用した<strong>独自の簡易計算により描画した擬似的な画像</strong>です。</p>
+        <p>出力結果は本来の赤色立体図とはアルゴリズムが異なる別物であることをご理解の上、林業業務等の参考としてご利用ください。</p>
+        <div style="text-align: right; margin-top: 15px;">
+            <button class="btn-blue" onclick="document.getElementById('modal').style.display='none'">同意して利用する</button>
+        </div>
+    </div>
+</div>
+
+<div id="controls">
+    <select id="prefSelect" onchange="changePref()">
+        <option value="35.689,139.691">東京都</option>
+        <option value="36.065,136.221" selected>福井県</option>
+        <option value="35.011,135.768">京都府</option>
+        <option value="34.686,135.520">大阪府</option>
+        <!-- 必要に応じて前回の都道府県リストを追加してください -->
+    </select>
+    
+    <div>
+        <input type="text" id="latLonInput" placeholder="緯度, 経度">
+        <button class="btn-blue" onclick="jumpToCoordinates()">移動</button>
+    </div>
+    
+    <button class="btn-green" onclick="createReliefMap()">✨ 枠内に微地形図を作成</button>
+    <button class="btn-red" id="btnExport" onclick="exportImage()" disabled>💾 林小班図用に切出</button>
+    
+    <span id="loading">処理中...（数秒かかります）</span>
+</div>
+
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/piexifjs@1.0.6/piexif.js"></script>
+
+<script>
+    // 初期設定
+    const map = L.map('map').setView([36.065, 136.221], 15);
+    L.tileLayer('https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png', {
+        attribution: '地理院タイル (淡色地図)',
+        maxZoom: 18
+    }).addTo(map);
+    L.control.scale({ imperial: false, metric: true }).addTo(map);
+
+    // ==========================================
+    // ① A3横 1/5000（2100m x 1485m）の枠を描画
+    // ==========================================
+    const frameLayer = L.rectangle([[0,0], [0,0]], {
+        color: "#ff0000", weight: 3, fillOpacity: 0.05, interactive: false, dashArray: '5, 5'
+    }).addTo(map);
+
+    function updateFrame() {
+        const center = map.getCenter();
+        const latM = 2100 / 2;   // 左右の距離 1050m
+        const lngM = 1485 / 2;   // 上下の距離 742.5m
+        
+        // 距離(m)を緯度経度の差分に変換
+        const R = 6378137; // 地球の半径
+        const dLat = (lngM / R) * (180 / Math.PI);
+        const dLng = (latM / (R * Math.cos(Math.PI * center.lat / 180))) * (180 / Math.PI);
+        
+        const bounds = L.latLngBounds(
+            [center.lat - dLat, center.lng - dLng],
+            [center.lat + dLat, center.lng + dLng]
+        );
+        frameLayer.setBounds(bounds);
+    }
+    // 地図が動くたびに枠を中央に追従させる
+    map.on('move', updateFrame);
+    updateFrame();
+
+    // ==========================================
+    // ② コントロールUIの処理
+    // ==========================================
+    function changePref() {
+        const val = document.getElementById("prefSelect").value.split(",");
+        map.setView([parseFloat(val[0]), parseFloat(val[1])], 14);
+    }
+
+    function jumpToCoordinates() {
+        const inputVal = document.getElementById("latLonInput").value.replace(/,/g, ' ').trim().split(/\s+/);
+        if (inputVal.length >= 2) {
+            map.setView([parseFloat(inputVal[0]), parseFloat(inputVal[1])], 15);
+        }
+    }
+
+    // ==========================================
+    // ③ 赤色立体図風の生成処理
+    // ==========================================
+    let currentOverlay = null;
+    let exportDataUrl = null;
+    let exportBounds = null;
+
+    async function createReliefMap() {
+        document.getElementById('loading').style.display = 'inline';
+        document.getElementById('btnExport').disabled = true;
+        
+        // 処理の重さを防ぐため、少し待機してUIを更新させる
+        await new Promise(resolve => setTimeout(resolve, 100));
+
+        const bounds = frameLayer.getBounds();
+        exportBounds = bounds;
+        
+        // ズームレベル15の地理院タイル座標を計算
+        const z = 15;
+        const minTileX = Math.floor((bounds.getWest() + 180) / 360 * Math.pow(2, z));
+        const maxTileX = Math.floor((bounds.getEast() + 180) / 360 * Math.pow(2, z));
+        const lat2tile = (lat) => Math.floor((1 - Math.log(Math.tan(lat * Math.PI / 180) + 1 / Math.cos(lat * Math.PI / 180)) / Math.PI) / 2 * Math.pow(2, z));
+        const minTileY = lat2tile(bounds.getNorth());
+        const maxTileY = lat2tile(bounds.getSouth());
+
+        const tw = 256;
+        const canvas = document.createElement('canvas');
+        canvas.width = (maxTileX - minTileX + 1) * tw;
+        canvas.height = (maxTileY - minTileY + 1) * tw;
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+        // 枠内を覆う全てのDEMタイルを取得して結合
+        const promises = [];
+        for (let x = minTileX; x <= maxTileX; x++) {
+            for (let y = minTileY; y <= maxTileY; y++) {
+                promises.push(new Promise((resolve) => {
+                    const img = new Image();
+                    img.crossOrigin = 'anonymous';
+                    img.src = `https://cyberjapandata.gsi.go.jp/xyz/dem_png/${z}/${x}/${y}.png`;
+                    img.onload = () => {
+                        ctx.drawImage(img, (x - minTileX) * tw, (y - minTileY) * tw);
+                        resolve();
+                    };
+                    img.onerror = resolve; // 海などデータがない場合はスキップ
+                }));
+            }
+        }
+        await Promise.all(promises);
+
+        // --- ピクセル解析による微地形図化 ---
+        const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const data = imgData.data;
+        const outData = ctx.createImageData(canvas.width, canvas.height);
+        
+        const getZ = (i) => {
+            const r = data[i], g = data[i+1], b = data[i+2];
+            if (r === 128 && g === 0 && b === 0) return 0;
+            const v = (r << 16) + (g << 8) + b;
+            return (v < 8388608) ? v * 0.01 : (v - 16777216) * 0.01;
+        };
+
+        const w = canvas.width;
+        for (let py = 1; py < canvas.height - 1; py++) {
+            for (let px = 1; px < w - 1; px++) {
+                const idx = (py * w + px) * 4;
+                const zC = getZ(idx);
+                const zU = getZ(idx - w * 4), zD = getZ(idx + w * 4);
+                const zL = getZ(idx - 4), zR = getZ(idx + 4);
+                
+                // 傾斜量
+                const dx = (zR - zL) / 2, dy = (zD - zU) / 2;
+                const slope = Math.sqrt(dx * dx + dy * dy);
+                // 凹凸（ラプラシアン）
+                const laplacian = (zU + zD + zL + zR) / 4 - zC;
+                
+                // 赤色立体図風カラーリング
+                let r = 255;
+                let g = 255 - Math.min(slope * 45, 255);
+                let b = g;
+                let shade = laplacian * 80;
+                
+                outData.data[idx]   = Math.max(0, Math.min(255, r - shade));
+                outData.data[idx+1] = Math.max(0, Math.min(255, g - shade));
+                outData.data[idx+2] = Math.max(0, Math.min(255, b - shade));
+                outData.data[idx+3] = 255;
+            }
+        }
+        ctx.putImageData(outData, 0, 0);
+
+        // --- 赤枠の部分だけをトリミングして抽出 ---
+        const tile2lon = (x, z) => (x / Math.pow(2, z) * 360 - 180);
+        const tile2lat = (y, z) => {
+            const n = Math.PI - 2 * Math.PI * y / Math.pow(2, z);
+            return (180 / Math.PI * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n))));
+        };
+        
+        const cWest = tile2lon(minTileX, z);
+        const cNorth = tile2lat(minTileY, z);
+        const cEast = tile2lon(maxTileX + 1, z);
+        const cSouth = tile2lat(maxTileY + 1, z);
+        
+        const pxWest = ((bounds.getWest() - cWest) / (cEast - cWest)) * canvas.width;
+        const pxEast = ((bounds.getEast() - cWest) / (cEast - cWest)) * canvas.width;
+        const pxNorth = ((cNorth - bounds.getNorth()) / (cNorth - cSouth)) * canvas.height;
+        const pxSouth = ((cNorth - bounds.getSouth()) / (cNorth - cSouth)) * canvas.height;
+        
+        const cropW = pxEast - pxWest;
+        const cropH = pxSouth - pxNorth;
+        
+        const cropCanvas = document.createElement('canvas');
+        cropCanvas.width = cropW;
+        cropCanvas.height = cropH;
+        cropCanvas.getContext('2d').drawImage(canvas, pxWest, pxNorth, cropW, cropH, 0, 0, cropW, cropH);
+        
+        exportDataUrl = cropCanvas.toDataURL('image/jpeg', 0.95);
+        
+        if (currentOverlay) { map.removeLayer(currentOverlay); }
+        currentOverlay = L.imageOverlay(exportDataUrl, bounds, { opacity: 0.9 }).addTo(map);
+        
+        document.getElementById('loading').style.display = 'none';
+        document.getElementById('btnExport').disabled = false;
+    }
+
+    // ==========================================
+    // ④ Exif付与・エクスポート処理
+    // ==========================================
+    function exportImage() {
+        if (!exportDataUrl || !exportBounds) return;
+        
+        // 既存アプリと同じ形式（南,西,北,東）で座標を文字列化
+        const coordsString = `${exportBounds.getSouth().toFixed(6)},${exportBounds.getWest().toFixed(6)},${exportBounds.getNorth().toFixed(6)},${exportBounds.getEast().toFixed(6)}`;
+        
+        const zeroth = {};
+        zeroth[piexif.ImageIFD.ImageDescription] = coordsString;
+        const exifObj = {"0th": zeroth, "Exif": {}, "GPS": {}};
+        const exifBytes = piexif.dump(exifObj);
+        
+        const newDataUrl = piexif.insert(exifBytes, exportDataUrl);
+        
+        const link = document.createElement('a');
+        link.download = `pseudorelief_${Date.now()}.jpg`;
+        link.href = newDataUrl;
+        link.click();
+    }
+</script>
+</body>
+</html>
