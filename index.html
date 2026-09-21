@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
     <meta charset="UTF-8">
-    <title>微地形図アプリv1.3</title>
+    <title>微地形図アプリv1.4</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <style>
@@ -127,8 +127,8 @@
 
     function updateFrame() {
         const center = map.getCenter();
-        const latM = 2100 / 2;   // 左右の距離 1050m
-        const lngM = 1485 / 2;   // 上下の距離 742.5m
+        const latM = 2100 / 2;   
+        const lngM = 1485 / 2;   
         
         const R = 6378137;
         const dLat = (lngM / R) * (180 / Math.PI);
@@ -291,7 +291,6 @@
         }
     }
 
-    // Base64をBlobに変換する関数（iOS対応用）
     function dataURLtoBlob(dataurl) {
         const arr = dataurl.split(',');
         const mime = arr[0].match(/:(.*?);/)[1];
@@ -304,7 +303,6 @@
         return new Blob([u8arr], {type: mime});
     }
 
-    // Blobを直接ダウンロードさせるフォールバック関数
     function downloadBlob(blob, filename) {
         const blobUrl = window.URL.createObjectURL(blob);
         const link = document.createElement('a');
@@ -334,8 +332,11 @@
         const filename = `microtopo-map_${s}_${w}_${n}_${e}.jpg`;
         const blob = dataURLtoBlob(newDataUrl);
 
-        // iOSなど、Web Share APIが利用可能な場合は共有ダイアログ（保存先選択）を呼び出す
-        if (navigator.canShare && navigator.share) {
+        // スマートフォン・タブレットからのアクセスかを判定
+        const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+
+        // スマホかつWeb Share APIが利用可能な場合は共有ダイアログを呼び出す
+        if (isMobile && navigator.canShare && navigator.share) {
             const file = new File([blob], filename, { type: "image/jpeg" });
             if (navigator.canShare({ files: [file] })) {
                 navigator.share({
@@ -343,14 +344,13 @@
                     title: '微地形図'
                 }).catch((error) => {
                     console.log('共有キャンセルまたはエラー', error);
-                    // キャンセルや失敗時は通常のダウンロードへフォールバック
                     downloadBlob(blob, filename);
                 });
                 return;
             }
         }
         
-        // PCやAndroid等、共有APIが非対応の場合は直接ダウンロード
+        // PCからのアクセス、または共有API非対応の場合は直接ダウンロード
         downloadBlob(blob, filename);
     }
 </script>
