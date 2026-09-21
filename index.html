@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
     <meta charset="UTF-8">
-    <title>微地形図アプリv1.5</title>
+    <title>微地形図アプリv1.6</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 
@@ -262,9 +262,9 @@
                     const laplacian = (zU + zD + zL + zR) / 4.0 - zC;
                     
                     let r = 255;
-                    let g = 255 - Math.min(slope * 30, 255);
+                    let g = 255 - Math.min(slope * 40, 255);
                     let b = g;
-                    let shade = laplacian * 60;
+                    let shade = laplacian * 70;
                     
                     outData.data[idx]   = Math.max(0, Math.min(255, r - shade));
                     outData.data[idx+1] = Math.max(0, Math.min(255, g - shade));
