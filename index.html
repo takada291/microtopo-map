@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
     <meta charset="UTF-8">
-    <title>微地形図アプリv1.0</title>
+    <title>微地形図アプリv1.1</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <style>
@@ -136,7 +136,6 @@
         const latM = 2100 / 2;   // 左右の距離 1050m
         const lngM = 1485 / 2;   // 上下の距離 742.5m
         
-        // 距離(m)を緯度経度の差分に変換
         const R = 6378137; // 地球の半径
         const dLat = (lngM / R) * (180 / Math.PI);
         const dLng = (latM / (R * Math.cos(Math.PI * center.lat / 180))) * (180 / Math.PI);
@@ -147,7 +146,6 @@
         );
         frameLayer.setBounds(bounds);
     }
-    // 地図が動くたびに枠を中央に追従させる
     map.on('move', updateFrame);
     updateFrame();
 
@@ -174,119 +172,123 @@
     let exportBounds = null;
 
     async function createReliefMap() {
-        document.getElementById('loading').style.display = 'inline';
-        document.getElementById('btnExport').disabled = true;
-        
-        // 処理の重さを防ぐため、少し待機してUIを更新させる
-        await new Promise(resolve => setTimeout(resolve, 100));
+        try {
+            document.getElementById('loading').style.display = 'inline';
+            document.getElementById('btnExport').disabled = true;
+            
+            // 処理の重さを防ぐため、少し待機してUIを更新させる
+            await new Promise(resolve => setTimeout(resolve, 100));
 
-        const bounds = frameLayer.getBounds();
-        exportBounds = bounds;
-        
-        // ズームレベル15の地理院タイル座標を計算
-        const z = 15;
-        const minTileX = Math.floor((bounds.getWest() + 180) / 360 * Math.pow(2, z));
-        const maxTileX = Math.floor((bounds.getEast() + 180) / 360 * Math.pow(2, z));
-        const lat2tile = (lat) => Math.floor((1 - Math.log(Math.tan(lat * Math.PI / 180) + 1 / Math.cos(lat * Math.PI / 180)) / Math.PI) / 2 * Math.pow(2, z));
-        const minTileY = lat2tile(bounds.getNorth());
-        const maxTileY = lat2tile(bounds.getSouth());
+            const bounds = frameLayer.getBounds();
+            exportBounds = bounds;
+            const z = 15;
+            
+            // Leafletの投影変換を利用して正確なピクセル座標を取得
+            const topLeft = map.project(bounds.getNorthWest(), z);
+            const bottomRight = map.project(bounds.getSouthEast(), z);
 
-        const tw = 256;
-        const canvas = document.createElement('canvas');
-        canvas.width = (maxTileX - minTileX + 1) * tw;
-        canvas.height = (maxTileY - minTileY + 1) * tw;
-        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+            const minTileX = Math.floor(topLeft.x / 256);
+            const minTileY = Math.floor(topLeft.y / 256);
+            const maxTileX = Math.floor(bottomRight.x / 256);
+            const maxTileY = Math.floor(bottomRight.y / 256);
 
-        // 枠内を覆う全てのDEMタイルを取得して結合
-        const promises = [];
-        for (let x = minTileX; x <= maxTileX; x++) {
-            for (let y = minTileY; y <= maxTileY; y++) {
-                promises.push(new Promise((resolve) => {
-                    const img = new Image();
-                    img.crossOrigin = 'anonymous';
-                    img.src = `https://cyberjapandata.gsi.go.jp/xyz/dem_png/${z}/${x}/${y}.png`;
-                    img.onload = () => {
-                        ctx.drawImage(img, (x - minTileX) * tw, (y - minTileY) * tw);
-                        resolve();
-                    };
-                    img.onerror = resolve; // 海などデータがない場合はスキップ
-                }));
+            const tw = 256;
+            const canvas = document.createElement('canvas');
+            canvas.width = (maxTileX - minTileX + 1) * tw;
+            canvas.height = (maxTileY - minTileY + 1) * tw;
+            const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+            // 枠内を覆う全てのDEMタイルを取得して結合
+            const promises = [];
+            for (let x = minTileX; x <= maxTileX; x++) {
+                for (let y = minTileY; y <= maxTileY; y++) {
+                    promises.push(new Promise((resolve) => {
+                        const img = new Image();
+                        img.crossOrigin = 'anonymous';
+                        img.src = `https://cyberjapandata.gsi.go.jp/xyz/dem_png/${z}/${x}/${y}.png`;
+                        img.onload = () => {
+                            ctx.drawImage(img, (x - minTileX) * tw, (y - minTileY) * tw);
+                            resolve();
+                        };
+                        img.onerror = resolve; // 海などデータがない場合はスキップ
+                    }));
+                }
             }
-        }
-        await Promise.all(promises);
+            await Promise.all(promises);
 
-        // --- ピクセル解析による微地形図化 ---
-        const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const data = imgData.data;
-        const outData = ctx.createImageData(canvas.width, canvas.height);
-        
-        const getZ = (i) => {
-            const r = data[i], g = data[i+1], b = data[i+2];
-            if (r === 128 && g === 0 && b === 0) return 0;
-            const v = (r << 16) + (g << 8) + b;
-            return (v < 8388608) ? v * 0.01 : (v - 16777216) * 0.01;
-        };
+            // --- ピクセル解析による微地形図化 ---
+            const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            const data = imgData.data;
+            const outData = ctx.createImageData(canvas.width, canvas.height);
+            
+            const getZ = (i) => {
+                const r = data[i], g = data[i+1], b = data[i+2];
+                // 地理院タイルの無効値（海など）対策
+                if ((r === 128 && g === 0 && b === 0) || (r === 0 && g === 0 && b === 0 && data[i+3] === 0)) return null;
+                const v = (r << 16) + (g << 8) + b;
+                return (v < 8388608) ? v * 0.01 : (v - 16777216) * 0.01;
+            };
 
-        const w = canvas.width;
-        for (let py = 1; py < canvas.height - 1; py++) {
-            for (let px = 1; px < w - 1; px++) {
-                const idx = (py * w + px) * 4;
-                const zC = getZ(idx);
-                const zU = getZ(idx - w * 4), zD = getZ(idx + w * 4);
-                const zL = getZ(idx - 4), zR = getZ(idx + 4);
-                
-                // 傾斜量
-                const dx = (zR - zL) / 2, dy = (zD - zU) / 2;
-                const slope = Math.sqrt(dx * dx + dy * dy);
-                // 凹凸（ラプラシアン）
-                const laplacian = (zU + zD + zL + zR) / 4 - zC;
-                
-                // 赤色立体図風カラーリング
-                let r = 255;
-                let g = 255 - Math.min(slope * 45, 255);
-                let b = g;
-                let shade = laplacian * 80;
-                
-                outData.data[idx]   = Math.max(0, Math.min(255, r - shade));
-                outData.data[idx+1] = Math.max(0, Math.min(255, g - shade));
-                outData.data[idx+2] = Math.max(0, Math.min(255, b - shade));
-                outData.data[idx+3] = 255;
+            const w = canvas.width;
+            for (let py = 1; py < canvas.height - 1; py++) {
+                for (let px = 1; px < w - 1; px++) {
+                    const idx = (py * w + px) * 4;
+                    const zC = getZ(idx);
+                    
+                    if (zC === null) {
+                        outData.data[idx+3] = 0; // 無効値は透明
+                        continue;
+                    }
+                    
+                    // 端のピクセルで隣が欠損している場合は中央値で代用
+                    const zU = getZ(idx - w * 4) ?? zC;
+                    const zD = getZ(idx + w * 4) ?? zC;
+                    const zL = getZ(idx - 4) ?? zC;
+                    const zR = getZ(idx + 4) ?? zC;
+                    
+                    // 傾斜量
+                    const dx = (zR - zL) / 2, dy = (zD - zU) / 2;
+                    const slope = Math.sqrt(dx * dx + dy * dy);
+                    // 凹凸（ラプラシアン）
+                    const laplacian = (zU + zD + zL + zR) / 4 - zC;
+                    
+                    // 赤色立体図風カラーリング
+                    let r = 255;
+                    let g = 255 - Math.min(slope * 45, 255);
+                    let b = g;
+                    let shade = laplacian * 80;
+                    
+                    outData.data[idx]   = Math.max(0, Math.min(255, r - shade));
+                    outData.data[idx+1] = Math.max(0, Math.min(255, g - shade));
+                    outData.data[idx+2] = Math.max(0, Math.min(255, b - shade));
+                    outData.data[idx+3] = 255;
+                }
             }
-        }
-        ctx.putImageData(outData, 0, 0);
+            ctx.putImageData(outData, 0, 0);
 
-        // --- 赤枠の部分だけをトリミングして抽出 ---
-        const tile2lon = (x, z) => (x / Math.pow(2, z) * 360 - 180);
-        const tile2lat = (y, z) => {
-            const n = Math.PI - 2 * Math.PI * y / Math.pow(2, z);
-            return (180 / Math.PI * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n))));
-        };
-        
-        const cWest = tile2lon(minTileX, z);
-        const cNorth = tile2lat(minTileY, z);
-        const cEast = tile2lon(maxTileX + 1, z);
-        const cSouth = tile2lat(maxTileY + 1, z);
-        
-        const pxWest = ((bounds.getWest() - cWest) / (cEast - cWest)) * canvas.width;
-        const pxEast = ((bounds.getEast() - cWest) / (cEast - cWest)) * canvas.width;
-        const pxNorth = ((cNorth - bounds.getNorth()) / (cNorth - cSouth)) * canvas.height;
-        const pxSouth = ((cNorth - bounds.getSouth()) / (cNorth - cSouth)) * canvas.height;
-        
-        const cropW = pxEast - pxWest;
-        const cropH = pxSouth - pxNorth;
-        
-        const cropCanvas = document.createElement('canvas');
-        cropCanvas.width = cropW;
-        cropCanvas.height = cropH;
-        cropCanvas.getContext('2d').drawImage(canvas, pxWest, pxNorth, cropW, cropH, 0, 0, cropW, cropH);
-        
-        exportDataUrl = cropCanvas.toDataURL('image/jpeg', 0.95);
-        
-        if (currentOverlay) { map.removeLayer(currentOverlay); }
-        currentOverlay = L.imageOverlay(exportDataUrl, bounds, { opacity: 0.9 }).addTo(map);
-        
-        document.getElementById('loading').style.display = 'none';
-        document.getElementById('btnExport').disabled = false;
+            // --- 赤枠の部分だけを正確にトリミング ---
+            const pxWest = Math.round(topLeft.x - minTileX * 256);
+            const pxNorth = Math.round(topLeft.y - minTileY * 256);
+            const cropW = Math.round(bottomRight.x - topLeft.x);
+            const cropH = Math.round(bottomRight.y - topLeft.y);
+            
+            const cropCanvas = document.createElement('canvas');
+            cropCanvas.width = cropW;
+            cropCanvas.height = cropH;
+            cropCanvas.getContext('2d').drawImage(canvas, pxWest, pxNorth, cropW, cropH, 0, 0, cropW, cropH);
+            
+            exportDataUrl = cropCanvas.toDataURL('image/jpeg', 0.95);
+            
+            if (currentOverlay) { map.removeLayer(currentOverlay); }
+            currentOverlay = L.imageOverlay(exportDataUrl, bounds, { opacity: 0.9 }).addTo(map);
+            
+            document.getElementById('btnExport').disabled = false;
+        } catch (error) {
+            console.error("生成エラー:", error);
+            alert("画像の作成に失敗しました。地図を少し動かして再度お試しください。\n" + error.message);
+        } finally {
+            document.getElementById('loading').style.display = 'none';
+        }
     }
 
     // ==========================================
@@ -305,8 +307,13 @@
         
         const newDataUrl = piexif.insert(exifBytes, exportDataUrl);
         
+        // ファイル名に緯度経度を付与
+        const centerLat = exportBounds.getCenter().lat.toFixed(5);
+        const centerLng = exportBounds.getCenter().lng.toFixed(5);
+        const filename = `microtopo-map_${centerLat}_${centerLng}.jpg`;
+        
         const link = document.createElement('a');
-        link.download = `pseudorelief_${Date.now()}.jpg`;
+        link.download = filename;
         link.href = newDataUrl;
         link.click();
     }
