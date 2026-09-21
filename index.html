@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
     <meta charset="UTF-8">
-    <title>微地形図アプリv1.1</title>
+    <title>微地形図アプリv1.2</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <style>
@@ -171,19 +171,41 @@
     let exportDataUrl = null;
     let exportBounds = null;
 
+    // 5mメッシュ(DEM5A, 5B, 5C)を順番に探す関数
+    const fetchDemTile = (x, y, z) => {
+        return new Promise((resolve) => {
+            const types = ['dem5a_png', 'dem5b_png', 'dem5c_png'];
+            let currentIdx = 0;
+            
+            const tryNext = () => {
+                if (currentIdx >= types.length) {
+                    resolve(null); // 全て無い場合はスキップ
+                    return;
+                }
+                const img = new Image();
+                img.crossOrigin = 'anonymous';
+                img.src = `https://cyberjapandata.gsi.go.jp/xyz/${types[currentIdx]}/${z}/${x}/${y}.png`;
+                img.onload = () => resolve(img);
+                img.onerror = () => {
+                    currentIdx++;
+                    tryNext();
+                };
+            };
+            tryNext();
+        });
+    };
+
     async function createReliefMap() {
         try {
             document.getElementById('loading').style.display = 'inline';
             document.getElementById('btnExport').disabled = true;
             
-            // 処理の重さを防ぐため、少し待機してUIを更新させる
             await new Promise(resolve => setTimeout(resolve, 100));
 
             const bounds = frameLayer.getBounds();
             exportBounds = bounds;
             const z = 15;
             
-            // Leafletの投影変換を利用して正確なピクセル座標を取得
             const topLeft = map.project(bounds.getNorthWest(), z);
             const bottomRight = map.project(bounds.getSouthEast(), z);
 
@@ -198,19 +220,14 @@
             canvas.height = (maxTileY - minTileY + 1) * tw;
             const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
-            // 枠内を覆う全てのDEMタイルを取得して結合
+            // タイルの取得と描画
             const promises = [];
             for (let x = minTileX; x <= maxTileX; x++) {
                 for (let y = minTileY; y <= maxTileY; y++) {
-                    promises.push(new Promise((resolve) => {
-                        const img = new Image();
-                        img.crossOrigin = 'anonymous';
-                        img.src = `https://cyberjapandata.gsi.go.jp/xyz/dem_png/${z}/${x}/${y}.png`;
-                        img.onload = () => {
+                    promises.push(fetchDemTile(x, y, z).then(img => {
+                        if (img) {
                             ctx.drawImage(img, (x - minTileX) * tw, (y - minTileY) * tw);
-                            resolve();
-                        };
-                        img.onerror = resolve; // 海などデータがない場合はスキップ
+                        }
                     }));
                 }
             }
@@ -222,9 +239,9 @@
             const outData = ctx.createImageData(canvas.width, canvas.height);
             
             const getZ = (i) => {
-                const r = data[i], g = data[i+1], b = data[i+2];
-                // 地理院タイルの無効値（海など）対策
-                if ((r === 128 && g === 0 && b === 0) || (r === 0 && g === 0 && b === 0 && data[i+3] === 0)) return null;
+                const r = data[i], g = data[i+1], b = data[i+2], a = data[i+3];
+                // 透明、もしくは無効値（海など）
+                if (a === 0 || (r === 128 && g === 0 && b === 0) || (r === 0 && g === 0 && b === 0)) return null;
                 const v = (r << 16) + (g << 8) + b;
                 return (v < 8388608) ? v * 0.01 : (v - 16777216) * 0.01;
             };
@@ -236,32 +253,32 @@
                     const zC = getZ(idx);
                     
                     if (zC === null) {
-                        outData.data[idx+3] = 0; // 無効値は透明
+                        // データが無い場所はJPEG化時の黒ベタを防ぐため、薄いグレーを塗る
+                        outData.data[idx] = 240; outData.data[idx+1] = 240; outData.data[idx+2] = 240; outData.data[idx+3] = 255;
                         continue;
                     }
                     
-                    // 端のピクセルで隣が欠損している場合は中央値で代用
                     const zU = getZ(idx - w * 4) ?? zC;
                     const zD = getZ(idx + w * 4) ?? zC;
                     const zL = getZ(idx - 4) ?? zC;
                     const zR = getZ(idx + 4) ?? zC;
                     
                     // 傾斜量
-                    const dx = (zR - zL) / 2, dy = (zD - zU) / 2;
+                    const dx = (zR - zL) / 2.0, dy = (zD - zU) / 2.0;
                     const slope = Math.sqrt(dx * dx + dy * dy);
                     // 凹凸（ラプラシアン）
-                    const laplacian = (zU + zD + zL + zR) / 4 - zC;
+                    const laplacian = (zU + zD + zL + zR) / 4.0 - zC;
                     
                     // 赤色立体図風カラーリング
                     let r = 255;
-                    let g = 255 - Math.min(slope * 45, 255);
+                    let g = 255 - Math.min(slope * 30, 255); // 傾斜の赤み調整
                     let b = g;
-                    let shade = laplacian * 80;
+                    let shade = laplacian * 60; // 尾根・谷の明暗調整
                     
                     outData.data[idx]   = Math.max(0, Math.min(255, r - shade));
                     outData.data[idx+1] = Math.max(0, Math.min(255, g - shade));
                     outData.data[idx+2] = Math.max(0, Math.min(255, b - shade));
-                    outData.data[idx+3] = 255;
+                    outData.data[idx+3] = 255; // 不透明
                 }
             }
             ctx.putImageData(outData, 0, 0);
@@ -275,7 +292,14 @@
             const cropCanvas = document.createElement('canvas');
             cropCanvas.width = cropW;
             cropCanvas.height = cropH;
-            cropCanvas.getContext('2d').drawImage(canvas, pxWest, pxNorth, cropW, cropH, 0, 0, cropW, cropH);
+            const cropCtx = cropCanvas.getContext('2d');
+            
+            // 白背景で塗りつぶす（透明起因の黒化を完全防止）
+            cropCtx.fillStyle = '#ffffff';
+            cropCtx.fillRect(0, 0, cropW, cropH);
+            
+            // 描画
+            cropCtx.drawImage(canvas, pxWest, pxNorth, cropW, cropH, 0, 0, cropW, cropH);
             
             exportDataUrl = cropCanvas.toDataURL('image/jpeg', 0.95);
             
@@ -297,9 +321,13 @@
     function exportImage() {
         if (!exportDataUrl || !exportBounds) return;
         
-        // 既存アプリと同じ形式（南,西,北,東）で座標を文字列化
-        const coordsString = `${exportBounds.getSouth().toFixed(6)},${exportBounds.getWest().toFixed(6)},${exportBounds.getNorth().toFixed(6)},${exportBounds.getEast().toFixed(6)}`;
+        const s = exportBounds.getSouth().toFixed(6);
+        const w = exportBounds.getWest().toFixed(6);
+        const n = exportBounds.getNorth().toFixed(6);
+        const e = exportBounds.getEast().toFixed(6);
         
+        // Exif情報の作成
+        const coordsString = `${s},${w},${n},${e}`;
         const zeroth = {};
         zeroth[piexif.ImageIFD.ImageDescription] = coordsString;
         const exifObj = {"0th": zeroth, "Exif": {}, "GPS": {}};
@@ -307,10 +335,8 @@
         
         const newDataUrl = piexif.insert(exifBytes, exportDataUrl);
         
-        // ファイル名に緯度経度を付与
-        const centerLat = exportBounds.getCenter().lat.toFixed(5);
-        const centerLng = exportBounds.getCenter().lng.toFixed(5);
-        const filename = `microtopo-map_${centerLat}_${centerLng}.jpg`;
+        // 林小班図アプリで読み込める指定のファイル名形式に変更
+        const filename = `microtopo-map_${s}_${w}_${n}_${e}.jpg`;
         
         const link = document.createElement('a');
         link.download = filename;
