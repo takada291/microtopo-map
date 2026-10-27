@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
     <meta charset="UTF-8">
-    <title>微地形図アプリv1.7</title>
+    <title>微地形図アプリv1.8</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 
@@ -170,6 +170,7 @@
     let exportDataUrl = null;
     let exportBounds = null;
 
+    // 5mメッシュを探し、無ければ10mメッシュで補完する関数
     const fetchDemTile = (x, y, z) => {
         return new Promise((resolve) => {
             const types = ['dem5a_png', 'dem5b_png', 'dem5c_png'];
@@ -177,7 +178,33 @@
             
             const tryNext = () => {
                 if (currentIdx >= types.length) {
-                    resolve(null);
+                    // 5mメッシュが全て無い場合は、10mメッシュ(dem_png)のズーム14を取得して補間する
+                    const parentZ = z - 1; // 14
+                    const parentX = Math.floor(x / 2);
+                    const parentY = Math.floor(y / 2);
+                    
+                    const parentImg = new Image();
+                    parentImg.crossOrigin = 'anonymous';
+                    parentImg.src = `https://cyberjapandata.gsi.go.jp/xyz/dem_png/${parentZ}/${parentX}/${parentY}.png`;
+                    parentImg.onload = () => {
+                        const tempCanvas = document.createElement('canvas');
+                        tempCanvas.width = 256;
+                        tempCanvas.height = 256;
+                        const tempCtx = tempCanvas.getContext('2d', { willReadFrequently: true });
+                        
+                        // RGBの標高値が混ざって壊れるのを防ぐため、アンチエイリアス（スムージング）を無効化
+                        tempCtx.imageSmoothingEnabled = false;
+                        
+                        // 10mメッシュ(256x256)のうち、該当する四半部分(128x128)を切り出して256x256に拡大描画
+                        const srcX = (x % 2) * 128;
+                        const srcY = (y % 2) * 128;
+                        tempCtx.drawImage(parentImg, srcX, srcY, 128, 128, 0, 0, 256, 256);
+                        
+                        resolve(tempCanvas);
+                    };
+                    parentImg.onerror = () => {
+                        resolve(null); // 10mメッシュすら無い場所
+                    };
                     return;
                 }
                 const img = new Image();
