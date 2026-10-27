@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
     <meta charset="UTF-8">
-    <title>微地形図アプリv1.8</title>
+    <title>微地形図アプリv1.9</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 
@@ -170,56 +170,6 @@
     let exportDataUrl = null;
     let exportBounds = null;
 
-    // 5mメッシュを探し、無ければ10mメッシュで補完する関数
-    const fetchDemTile = (x, y, z) => {
-        return new Promise((resolve) => {
-            const types = ['dem5a_png', 'dem5b_png', 'dem5c_png'];
-            let currentIdx = 0;
-            
-            const tryNext = () => {
-                if (currentIdx >= types.length) {
-                    // 5mメッシュが全て無い場合は、10mメッシュ(dem_png)のズーム14を取得して補間する
-                    const parentZ = z - 1; // 14
-                    const parentX = Math.floor(x / 2);
-                    const parentY = Math.floor(y / 2);
-                    
-                    const parentImg = new Image();
-                    parentImg.crossOrigin = 'anonymous';
-                    parentImg.src = `https://cyberjapandata.gsi.go.jp/xyz/dem_png/${parentZ}/${parentX}/${parentY}.png`;
-                    parentImg.onload = () => {
-                        const tempCanvas = document.createElement('canvas');
-                        tempCanvas.width = 256;
-                        tempCanvas.height = 256;
-                        const tempCtx = tempCanvas.getContext('2d', { willReadFrequently: true });
-                        
-                        // RGBの標高値が混ざって壊れるのを防ぐため、アンチエイリアス（スムージング）を無効化
-                        tempCtx.imageSmoothingEnabled = false;
-                        
-                        // 10mメッシュ(256x256)のうち、該当する四半部分(128x128)を切り出して256x256に拡大描画
-                        const srcX = (x % 2) * 128;
-                        const srcY = (y % 2) * 128;
-                        tempCtx.drawImage(parentImg, srcX, srcY, 128, 128, 0, 0, 256, 256);
-                        
-                        resolve(tempCanvas);
-                    };
-                    parentImg.onerror = () => {
-                        resolve(null); // 10mメッシュすら無い場所
-                    };
-                    return;
-                }
-                const img = new Image();
-                img.crossOrigin = 'anonymous';
-                img.src = `https://cyberjapandata.gsi.go.jp/xyz/${types[currentIdx]}/${z}/${x}/${y}.png`;
-                img.onload = () => resolve(img);
-                img.onerror = () => {
-                    currentIdx++;
-                    tryNext();
-                };
-            };
-            tryNext();
-        });
-    };
-
     async function createReliefMap() {
         try {
             document.getElementById('loading').style.display = 'inline';
@@ -239,50 +189,120 @@
             const maxTileX = Math.floor(bottomRight.x / 256);
             const maxTileY = Math.floor(bottomRight.y / 256);
 
-            const tw = 256;
-            const canvas = document.createElement('canvas');
-            canvas.width = (maxTileX - minTileX + 1) * tw;
-            canvas.height = (maxTileY - minTileY + 1) * tw;
-            const ctx = canvas.getContext('2d', { willReadFrequently: true });
+            const w = (maxTileX - minTileX + 1) * 256;
+            const h = (maxTileY - minTileY + 1) * 256;
+            
+            // ピクセル単位で標高を保持するZバッファ（初期値は全て無効値: NaN）
+            const zValues = new Float32Array(w * h).fill(NaN);
+
+            const loadTile = (url) => new Promise((resolve) => {
+                const img = new Image();
+                img.crossOrigin = 'anonymous';
+                img.src = url;
+                img.onload = () => resolve(img);
+                img.onerror = () => resolve(null);
+            });
+
+            // 画像のRGB値から標高（Z値）の配列を抽出する関数
+            const parseImageToZ = (img, x, y, is10m) => {
+                if (!img) return null;
+                const c = document.createElement('canvas');
+                c.width = 256; c.height = 256;
+                const cx = c.getContext('2d', { willReadFrequently: true });
+                cx.imageSmoothingEnabled = false;
+
+                if (is10m) {
+                    // 10mメッシュは親タイル(14)から該当四半部を切り出して256x256に拡大
+                    const srcX = (x % 2) * 128;
+                    const srcY = (y % 2) * 128;
+                    cx.drawImage(img, srcX, srcY, 128, 128, 0, 0, 256, 256);
+                } else {
+                    cx.drawImage(img, 0, 0);
+                }
+
+                const data = cx.getImageData(0, 0, 256, 256).data;
+                const zs = new Float32Array(256 * 256).fill(NaN);
+                for (let i = 0; i < 256 * 256; i++) {
+                    const idx = i * 4;
+                    const r = data[idx], g = data[idx+1], b = data[idx+2], a = data[idx+3];
+                    // 海などの無効値（透明、または 128,0,0 や 0,0,0）を除外
+                    if (a === 0 || (r === 128 && g === 0 && b === 0) || (r === 0 && g === 0 && b === 0)) continue;
+                    const v = (r << 16) + (g << 8) + b;
+                    zs[i] = (v < 8388608) ? v * 0.01 : (v - 16777216) * 0.01;
+                }
+                return zs;
+            };
 
             const promises = [];
+            // 必要な全タイル領域に対して処理
             for (let x = minTileX; x <= maxTileX; x++) {
                 for (let y = minTileY; y <= maxTileY; y++) {
-                    promises.push(fetchDemTile(x, y, z).then(img => {
-                        if (img) {
-                            ctx.drawImage(img, (x - minTileX) * tw, (y - minTileY) * tw);
+                    promises.push((async () => {
+                        const parentZ = z - 1;
+                        const parentX = Math.floor(x / 2);
+                        const parentY = Math.floor(y / 2);
+
+                        // 10m(z=14)、5C、5B、5Aの画像を全て並列で取得
+                        const [img10, img5c, img5b, img5a] = await Promise.all([
+                            loadTile(`https://cyberjapandata.gsi.go.jp/xyz/dem_png/${parentZ}/${parentX}/${parentY}.png`),
+                            loadTile(`https://cyberjapandata.gsi.go.jp/xyz/dem5c_png/${z}/${x}/${y}.png`),
+                            loadTile(`https://cyberjapandata.gsi.go.jp/xyz/dem5b_png/${z}/${x}/${y}.png`),
+                            loadTile(`https://cyberjapandata.gsi.go.jp/xyz/dem5a_png/${z}/${x}/${y}.png`)
+                        ]);
+
+                        const z10 = parseImageToZ(img10, x, y, true);
+                        const z5c = parseImageToZ(img5c, x, y, false);
+                        const z5b = parseImageToZ(img5b, x, y, false);
+                        const z5a = parseImageToZ(img5a, x, y, false);
+
+                        const offsetX = (x - minTileX) * 256;
+                        const offsetY = (y - minTileY) * 256;
+
+                        // 1ピクセルずつ、最も精度の高いデータを採用してZバッファに書き込む
+                        for (let ty = 0; ty < 256; ty++) {
+                            for (let tx = 0; tx < 256; tx++) {
+                                const localIdx = ty * 256 + tx;
+                                const globalIdx = (offsetY + ty) * w + (offsetX + tx);
+
+                                let val = NaN;
+                                // 優先順位: 5A > 5B > 5C > 10m
+                                if (z5a && !isNaN(z5a[localIdx])) val = z5a[localIdx];
+                                else if (z5b && !isNaN(z5b[localIdx])) val = z5b[localIdx];
+                                else if (z5c && !isNaN(z5c[localIdx])) val = z5c[localIdx];
+                                else if (z10 && !isNaN(z10[localIdx])) val = z10[localIdx];
+
+                                zValues[globalIdx] = val;
+                            }
                         }
-                    }));
+                    })());
                 }
             }
             await Promise.all(promises);
 
-            const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-            const data = imgData.data;
-            const outData = ctx.createImageData(canvas.width, canvas.height);
-            
-            const getZ = (i) => {
-                const r = data[i], g = data[i+1], b = data[i+2], a = data[i+3];
-                if (a === 0 || (r === 128 && g === 0 && b === 0) || (r === 0 && g === 0 && b === 0)) return null;
-                const v = (r << 16) + (g << 8) + b;
-                return (v < 8388608) ? v * 0.01 : (v - 16777216) * 0.01;
-            };
+            // Zバッファ（標高配列）を元に微地形図を描画
+            const canvas = document.createElement('canvas');
+            canvas.width = w;
+            canvas.height = h;
+            const ctx = canvas.getContext('2d');
+            const outData = ctx.createImageData(w, h);
 
-            const w = canvas.width;
-            for (let py = 1; py < canvas.height - 1; py++) {
+            for (let py = 1; py < h - 1; py++) {
                 for (let px = 1; px < w - 1; px++) {
-                    const idx = (py * w + px) * 4;
-                    const zC = getZ(idx);
+                    const zIdx = py * w + px;
+                    const zC = zValues[zIdx];
                     
-                    if (zC === null) {
-                        outData.data[idx] = 240; outData.data[idx+1] = 240; outData.data[idx+2] = 240; outData.data[idx+3] = 255;
+                    const pIdx = zIdx * 4;
+                    
+                    if (isNaN(zC)) {
+                        // どのメッシュにもデータが存在しない場所はグレー
+                        outData.data[pIdx] = 240; outData.data[pIdx+1] = 240; outData.data[pIdx+2] = 240; outData.data[pIdx+3] = 255;
                         continue;
                     }
                     
-                    const zU = getZ(idx - w * 4) ?? zC;
-                    const zD = getZ(idx + w * 4) ?? zC;
-                    const zL = getZ(idx - 4) ?? zC;
-                    const zR = getZ(idx + 4) ?? zC;
+                    const zU = isNaN(zValues[zIdx - w]) ? zC : zValues[zIdx - w];
+                    const zD = isNaN(zValues[zIdx + w]) ? zC : zValues[zIdx + w];
+                    const zL = isNaN(zValues[zIdx - 1]) ? zC : zValues[zIdx - 1];
+                    const zR = isNaN(zValues[zIdx + 1]) ? zC : zValues[zIdx + 1];
                     
                     const dx = (zR - zL) / 2.0, dy = (zD - zU) / 2.0;
                     const slope = Math.sqrt(dx * dx + dy * dy);
@@ -293,14 +313,15 @@
                     let b = g;
                     let shade = laplacian * 80;
                     
-                    outData.data[idx]   = Math.max(0, Math.min(255, r - shade));
-                    outData.data[idx+1] = Math.max(0, Math.min(255, g - shade));
-                    outData.data[idx+2] = Math.max(0, Math.min(255, b - shade));
-                    outData.data[idx+3] = 255;
+                    outData.data[pIdx]   = Math.max(0, Math.min(255, r - shade));
+                    outData.data[pIdx+1] = Math.max(0, Math.min(255, g - shade));
+                    outData.data[pIdx+2] = Math.max(0, Math.min(255, b - shade));
+                    outData.data[pIdx+3] = 255;
                 }
             }
             ctx.putImageData(outData, 0, 0);
 
+            // --- 赤枠の部分だけを正確にトリミング ---
             const pxWest = Math.round(topLeft.x - minTileX * 256);
             const pxNorth = Math.round(topLeft.y - minTileY * 256);
             const cropW = Math.round(bottomRight.x - topLeft.x);
@@ -370,10 +391,8 @@
         const filename = `microtopo-map_${s}_${w}_${n}_${e}.jpg`;
         const blob = dataURLtoBlob(newDataUrl);
 
-        // スマートフォン・タブレットからのアクセスかを判定
         const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
 
-        // スマホかつWeb Share APIが利用可能な場合は共有ダイアログを呼び出す
         if (isMobile && navigator.canShare && navigator.share) {
             const file = new File([blob], filename, { type: "image/jpeg" });
             if (navigator.canShare({ files: [file] })) {
@@ -388,7 +407,6 @@
             }
         }
         
-        // PCからのアクセス、または共有API非対応の場合は直接ダウンロード
         downloadBlob(blob, filename);
     }
 </script>
